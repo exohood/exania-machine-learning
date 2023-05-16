@@ -1,6 +1,6 @@
 from flaml import tune
 from copy import deepcopy
-from typing import Optional, Sequence, Union, Iterable
+from typing import Optional, Sequence, Union, Iterable, Dict
 from dataclasses import dataclass, field
 
 import warnings
@@ -14,7 +14,9 @@ class EstimatorConfig:
     fit_params: dict = field(default_factory=dict)
     search_space: dict = field(default_factory=dict)
     defaults: dict = field(default_factory=dict)
+    supports_multivalue: bool = False
     experimental: bool = False
+    inference: str = "bootstrap"
 
 
 class SimpleParamService:
@@ -22,6 +24,7 @@ class SimpleParamService:
         self,
         propensity_model,
         outcome_model,
+        multivalue: bool,
         final_model=None,
         n_bootstrap_samples: Optional[int] = None,
         n_jobs: Optional[int] = None,
@@ -33,12 +36,13 @@ class SimpleParamService:
         self.n_jobs = n_jobs
         self.include_experimental = include_experimental
         self.n_bootstrap_samples = n_bootstrap_samples
+        self.multivalue = multivalue
 
     def estimator_names_from_patterns(
         self,
         problem: str,
         patterns: Union[Sequence, str],
-        data_rows: Optional[int] = None
+        data_rows: Optional[int] = None,
     ):
         def problem_match(est_name: str, problem: str) -> bool:
             return est_name.split(".")[0] == problem
@@ -50,31 +54,53 @@ class SimpleParamService:
                 warnings.warn(
                     "Excluding OrthoForests as they can have problems with large datasets"
                 )
-                return [e for e in self.estimator_names if "OrthoForest" not in e]
+                return [
+                    e
+                    for e in self.estimator_names
+                    if ("OrthoForest" not in e) and (problem_match(e, problem))
+                ]
+
+        elif patterns == "cheap_inference":
+            cfgs = self._configs()
+            ests = [
+                est
+                for est in self.estimator_names
+                if cfgs[est].inference != "bootstrap" and problem_match(est, problem)
+            ]
+            if data_rows <= 1000:
+                return ests
+            else:
+                warnings.warn(
+                    "Excluding OrthoForests as they can have problems with large datasets"
+                )
+                return [e for e in ests if ("OrthoForest" not in e)]
 
         elif patterns == "auto":
             if problem == "backdoor":
-                # These are the ones we've seen best results from, empirically,
-                # plus dummy for baseline, and SLearner as that's the simplest possible
-                return self.estimator_names_from_patterns(
-                    problem,
-                    [
+                if self.multivalue:
+                    patterns = ["LinearDML"]
+                else:
+                    # These are the ones we've seen best results from, empirically,
+                    # plus dummy for baseline, and SLearner as that's the simplest possible
+                    patterns = [
                         "Dummy",
+                        "NewDummy",
                         "SLearner",
                         "DomainAdaptationLearner",
                         "TransformedOutcome",
                         "CausalForestDML",
                         "ForestDRLearner",
-                    ],
-                )
+                    ]
+
             elif problem == "iv":
-                return self.estimator_names_from_patterns(
-                    problem,
-                    [
-                        "OrthoIV",
-                        "DMLIV",
-                    ],
-                )
+                patterns = [
+                    "DMLIV",
+                    "LinearDRIV",
+                    "OrthoIV",
+                    "SparseLinearDRIV",
+                    "LinearIntentToTreatDRIV",
+                ]
+            return self.estimator_names_from_patterns(problem, patterns)
         else:
             try:
                 for p in patterns:
@@ -94,13 +120,18 @@ class SimpleParamService:
 
     @property
     def estimator_names(self):
+        cfgs = self._configs()
+        if self.multivalue:
+            cfgs = {k: v for k, v in cfgs.items() if v.supports_multivalue}
+
         if self.include_experimental:
-            return list(self._configs().keys())
+            return list(cfgs.keys())
         else:
-            return [est for est, cfg in self._configs().items() if not cfg.experimental]
+            return [est for est, cfg in cfgs.items() if not cfg.experimental]
 
     def search_space(self, estimator_list: Iterable[str]):
         """constructs search space with estimators and their respective configs
+
         Returns:
             dict: hierarchical search space
         """
@@ -141,7 +172,7 @@ class SimpleParamService:
     ):
         return self._configs()[estimator]
 
-    def _configs(self):
+    def _configs(self) -> Dict[str, EstimatorConfig]:
         propensity_model = deepcopy(self.propensity_model)
         outcome_model = deepcopy(self.outcome_model)
         if self.n_bootstrap_samples is not None:
@@ -157,39 +188,30 @@ class SimpleParamService:
         else:
             final_model = deepcopy(self.final_model)
 
-        configs: dict[str: dict[str:EstimatorConfig]] = {
-            "backdoor.auto_causality.models.Dummy": EstimatorConfig(),
-            "backdoor.auto_causality.models.NewDummy": EstimatorConfig(
-                init_params={"propensity_score_model": propensity_model},
-                experimental=True,
+        configs: dict[str:EstimatorConfig] = {
+            "backdoor.auto_causality.models.NaiveDummy": EstimatorConfig(),
+            "backdoor.auto_causality.models.Dummy": EstimatorConfig(
+                init_params={"propensity_model": propensity_model},
+                experimental=False,
             ),
             "backdoor.propensity_score_weighting": EstimatorConfig(
-                init_params={"propensity_score_model": propensity_model},
+                init_params={"propensity_model": propensity_model},
                 experimental=True,
             ),
             "backdoor.econml.metalearners.SLearner": EstimatorConfig(
                 init_params={"overall_model": outcome_model},
-                # TODO Egor please look into this
-                # These lines cause recursion errors
-                # if self.n_bootstrap_samples is None
-                # else {"inference": bootstrap},
+                supports_multivalue=True,
             ),
             "backdoor.econml.metalearners.TLearner": EstimatorConfig(
-                init_params={"overall_model": outcome_model},
-                # TODO Egor please look into this
-                # These lines cause recursion errors
-                # if self.n_bootstrap_samples is None
-                # else {"inference": bootstrap},
+                init_params={"models": outcome_model},
+                supports_multivalue=True,
             ),
             "backdoor.econml.metalearners.XLearner": EstimatorConfig(
                 init_params={
                     "propensity_model": propensity_model,
                     "models": outcome_model,
                 },
-                # TODO Egor please look into this
-                # These lines cause recursion errors
-                # if self.n_bootstrap_samples is None
-                # else {"inference": bootstrap},
+                supports_multivalue=True,
             ),
             "backdoor.econml.metalearners.DomainAdaptationLearner": EstimatorConfig(
                 init_params={
@@ -197,10 +219,7 @@ class SimpleParamService:
                     "models": outcome_model,
                     "final_models": final_model,
                 },
-                # TODO Egor please look into this
-                # These lines cause recursion errors
-                # if self.n_bootstrap_samples is None
-                # else {"inference": bootstrap},
+                supports_multivalue=True,
             ),
             "backdoor.econml.dr.ForestDRLearner": EstimatorConfig(
                 init_params={
@@ -220,7 +239,7 @@ class SimpleParamService:
                     "min_weight_fraction_leaf": tune.uniform(0, 0.5),
                     "max_features": tune.choice(["auto", "sqrt", "log2", None]),
                     "min_impurity_decrease": tune.uniform(0, 10),
-                    "max_samples": tune.uniform(0, 0.5),
+                    "max_samples": tune.uniform(1e-6, 0.5),
                     "min_balancedness_tol": tune.uniform(0, 0.5),
                     "honest": tune.choice([0, 1]),
                     "subforest_size": tune.randint(2, 10),
@@ -238,6 +257,8 @@ class SimpleParamService:
                     "honest": True,
                     "subforest_size": 4,
                 },
+                supports_multivalue=True,
+                inference="blb",
             ),
             "backdoor.econml.dr.LinearDRLearner": EstimatorConfig(
                 init_params={
@@ -254,6 +275,8 @@ class SimpleParamService:
                     "fit_cate_intercept": True,
                     "min_propensity": 1e-6,
                 },
+                supports_multivalue=True,
+                inference="auto",
             ),
             "backdoor.econml.dr.SparseLinearDRLearner": EstimatorConfig(
                 init_params={
@@ -280,6 +303,8 @@ class SimpleParamService:
                     "max_iter": 10000,
                     "mc_agg": "mean",
                 },
+                supports_multivalue=True,
+                inference="auto",
             ),
             "backdoor.econml.dml.LinearDML": EstimatorConfig(
                 init_params={
@@ -299,6 +324,8 @@ class SimpleParamService:
                     "fit_cate_intercept": True,
                     "mc_agg": "mean",
                 },
+                supports_multivalue=True,
+                inference="statsmodels",
             ),
             "backdoor.econml.dml.SparseLinearDML": EstimatorConfig(
                 init_params={
@@ -326,6 +353,8 @@ class SimpleParamService:
                     "max_iter": 10000,
                     "mc_agg": "mean",
                 },
+                supports_multivalue=True,
+                inference="auto",
             ),
             "backdoor.econml.dml.CausalForestDML": EstimatorConfig(
                 init_params={
@@ -334,7 +363,7 @@ class SimpleParamService:
                     # "max_depth": self.max_depth,
                     # "n_estimators": self.n_estimators,
                     "discrete_treatment": True,
-                    "inference": False,
+                    # "inference": False,
                     "mc_iters": None,
                     "max_depth": None,
                     "min_var_fraction_leaf": None,
@@ -351,7 +380,7 @@ class SimpleParamService:
                     # "min_var_fraction_leaf": tune.uniform(0, 1),
                     "max_features": tune.choice(["auto", "sqrt", "log2", None]),
                     "min_impurity_decrease": tune.uniform(0, 10),
-                    "max_samples": tune.uniform(0, 1),
+                    "max_samples": tune.uniform(1e-6, 0.5),
                     "min_balancedness_tol": tune.uniform(0, 0.5),
                     "honest": tune.choice([0, 1]),
                     # "inference": tune.choice([0, 1]),
@@ -376,6 +405,8 @@ class SimpleParamService:
                     "fit_intercept": True,
                     "subforest_size": 4,
                 },
+                supports_multivalue=True,
+                inference="auto",
             ),
             "backdoor.auto_causality.models.TransformedOutcome": EstimatorConfig(
                 init_params={
@@ -405,7 +436,7 @@ class SimpleParamService:
                     # "max_depth": self.max_depth,
                     # "n_trees": self.n_estimators,
                     # "min_leaf_size": self.min_leaf_size,
-                    "backend": "threading",
+                    "backend": "loky",
                 },
                 search_space={
                     "n_trees": tune.randint(2, 750),
@@ -422,6 +453,9 @@ class SimpleParamService:
                     "subsample_ratio": 0.7,
                     "lambda_reg": 0.01,
                 },
+                experimental=True,  # OrthoForest estimators are notoriously slow
+                supports_multivalue=True,
+                inference="blb",
             ),
             "backdoor.econml.orf.DMLOrthoForest": EstimatorConfig(
                 init_params={
@@ -453,30 +487,72 @@ class SimpleParamService:
                     # "bootstrap": tune.choice([0, 1]),
                     "lambda_reg": 0.01,
                 },
+                experimental=True,  # OrthoForest estimators are notoriously slow
+                supports_multivalue=True,
+                inference="blb",
+            ),
+            "iv.econml.iv.dr.LinearDRIV": EstimatorConfig(
+                init_params={
+                    "model_y_xw": outcome_model,
+                    "model_t_xw": propensity_model,
+                },
+                search_space={
+                    "projection": tune.choice([0, 1]),
+                },
+                defaults={"projection": True},
             ),
             "iv.econml.iv.dml.OrthoIV": EstimatorConfig(
                 init_params={
                     "model_y_xw": outcome_model,
                     "model_t_xw": propensity_model,
-                    "model_z_xw": deepcopy(propensity_model),
-                }
+                },
+                search_space={
+                    "mc_agg": tune.choice(["mean", "median"]),
+                },
+                defaults={
+                    "mc_agg": "mean",
+                },
             ),
             "iv.econml.iv.dml.DMLIV": EstimatorConfig(
                 init_params={
                     "model_y_xw": outcome_model,
                     "model_t_xw": propensity_model,
-                    "model_t_xwz": deepcopy(propensity_model),
-                    "model_final": final_model,
-                    "discrete_treatment": False,
                 },
                 search_space={
-                    "fit_cate_intercept": tune.choice([0, 1]),
                     "mc_agg": tune.choice(["mean", "median"]),
                 },
                 defaults={
-                    "fit_cate_intercept": True,
                     "mc_agg": "mean",
                 },
             ),
+            "iv.econml.iv.dr.SparseLinearDRIV": EstimatorConfig(
+                init_params={
+                    "model_y_xw": outcome_model,
+                    "model_t_xw": propensity_model,
+                },
+                search_space={
+                    "projection": tune.choice([0, 1]),
+                    "opt_reweighted": tune.choice([0, 1]),
+                    "cov_clip": tune.quniform(0.08, 0.2, 0.01),
+                },
+                defaults={
+                    "projection": 0,
+                    "opt_reweighted": 0,
+                    "cov_clip": 0.1,
+                },
+            ),
+            "iv.econml.iv.dr.LinearIntentToTreatDRIV": EstimatorConfig(
+                init_params={
+                    "model_y_xw": outcome_model,
+                },
+                search_space={
+                    "cov_clip": tune.quniform(0.08, 0.2, 0.01),
+                    "opt_reweighted": tune.choice([0, 1]),
+                },
+                defaults={
+                    "cov_clip": 0.1,
+                    "opt_reweighted": 1,
+                },
+            ),
         }
-        return 
+        return configs
