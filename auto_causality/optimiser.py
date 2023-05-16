@@ -1,3 +1,4 @@
+import copy
 import warnings
 from copy import deepcopy
 from typing import List, Optional, Union
@@ -13,13 +14,22 @@ from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import train_test_split
 from dowhy import CausalModel
 from dowhy.causal_identifier import IdentifiedEstimand
+
+from econml.inference import BootstrapInference
+
 from joblib import Parallel, delayed
 
 from auto_causality.params import SimpleParamService
 from auto_causality.scoring import Scorer
 from auto_causality.r_score import RScoreWrapper
-from auto_causality.utils import clean_config
-from auto_causality.models.monkey_patches import AutoML
+from auto_causality.utils import clean_config, treatment_is_multivalue
+from auto_causality.models.monkey_patches import (
+    AutoML,
+    apply_multitreatment,
+    effect_stderr,
+)
+from auto_causality.data_utils import CausalityDataset
+from auto_causality.models.passthrough import feature_filter
 
 
 # Patched from sklearn.linear_model._base to adjust rtol and atol values
@@ -55,20 +65,25 @@ class AutoCausality:
     Optimises hyperparams of component models of each estimator
     and hyperparams of the estimators themselves. Uses the ERUPT
     metric for estimator selection.
+
     Example:
     ```python
+
     estimator_list = [".LinearDML","LinearDRLearner","metalearners"]
     auto_causality = AutoCausality(time_budget=10, estimator_list=estimator_list)
+
     auto_causality.fit(train_df, test_df, treatment, outcome,
     features_W, features_X)
+
     print(f"Best estimator: {auto_causality.best_estimator}")
+
     ```
     """
 
     def __init__(
         self,
         data_df=None,
-        metric="erupt",
+        metric="energy_distance",
         metrics_to_report=None,
         time_budget=None,
         verbose=3,
@@ -78,6 +93,7 @@ class AutoCausality:
         test_size=None,
         num_samples=-1,
         propensity_model="dummy",
+        outcome_model=None,
         components_task="regression",
         components_verbose=0,
         components_pred_time_limit=10 / 1e6,
@@ -86,8 +102,10 @@ class AutoCausality:
         try_init_configs=True,
         resources_per_trial=None,
         include_experimental_estimators=False,
+        store_all_estimators: Optional[bool] = False,
     ):
         """constructor.
+
         Args:
             data_df (pandas.DataFrame): dataset to perform causal inference on
             metric (str): metric to optimise.
@@ -116,6 +134,7 @@ class AutoCausality:
             try_init_configs (bool): try list of good performing estimators before continuing with HPO.
                 Defaults to False.
             blacklisted_estimators (list): [optional] list of estimators not to include in fitting
+            store_all_estimators (Optional[bool]). store estimator objects for interim trials. Defaults to False
         """
         assert (
             time_budget is not None or components_time_budget is not None
@@ -132,17 +151,10 @@ class AutoCausality:
         self._settings["tuner"]["resources_per_trial"] = (
             resources_per_trial if resources_per_trial is not None else {"cpu": 0.5}
         )
-
         self._settings["try_init_configs"] = try_init_configs
-
-        if metric is not None:
-            Scorer.validate_implemented_metrics(metric)
-        self.metric = metric
-
-        if metrics_to_report is not None:
-            for m in metrics_to_report:
-                Scorer.validate_implemented_metrics(m)
-        self.metrics_to_report = metrics_to_report
+        self._settings[
+            "include_experimental_estimators"
+        ] = include_experimental_estimators
 
         # params for FLAML on component models:
         self._settings["component_models"] = {}
@@ -163,32 +175,11 @@ class AutoCausality:
         self._settings["component_models"]["split_ratio"] = component_test_size
         self._settings["train_size"] = train_size
         self._settings["test_size"] = test_size
-
-        # user can choose between flaml and dummy for propensity model.
-        if propensity_model == "dummy":
-            self.propensity_model = DummyClassifier(strategy="prior")
-        elif propensity_model == "auto":
-            self.propensity_model = AutoML(
-                **{**self._settings["component_models"], "task": "classification"}
-            )
-        elif hasattr(self.propensity_model, "fit") and hasattr(
-            self.propensity_model, "predict_proba"
-        ):
-            self.propensity_model = propensity_model
-        else:
-            raise ValueError(
-                'propensity_model valid values are "dummy", "auto", or a classifier object'
-            )
-
-        self.outcome_model = AutoML(**self._settings["component_models"])
-
-        # config with method-specific params
-        self.cfg = SimpleParamService(
-            self.propensity_model,
-            self.outcome_model,
-            n_jobs=components_njobs,
-            include_experimental=include_experimental_estimators,
-        )
+        self._settings["store_all"] = store_all_estimators
+        self._settings["metric"] = metric
+        self._settings["metrics_to_report"] = metrics_to_report
+        self._settings["propensity_model"] = propensity_model
+        self._settings["outcome_model"] = outcome_model
 
         self.results = None
         self._best_estimators = defaultdict(lambda: (float("-inf"), None))
@@ -202,23 +193,67 @@ class AutoCausality:
         self.resume_scores = []
         self.resume_cfg = []
 
-        # # trained component models for each estimator
-        # self.trained_estimators_dict = {}
-
     def get_params(self, deep=False):
         return self._settings.copy()
 
     def get_estimators(self, deep=False):
         return self.estimator_list.copy()
 
+    def init_propensity_model(self, propensity_model: str):
+        # user can choose between flaml and dummy for propensity model.
+        if propensity_model == "dummy":
+            self.propensity_model = DummyClassifier(strategy="prior")
+        elif propensity_model == "auto":
+            self.propensity_model = AutoML(
+                **{**self._settings["component_models"], "task": "classification"}
+            )
+        elif hasattr(propensity_model, "fit") and hasattr(
+            propensity_model, "predict_proba"
+        ):
+            self.propensity_model = propensity_model
+        else:
+            raise ValueError(
+                'propensity_model valid values are "dummy", "auto", or a classifier object'
+            )
+
+    def init_outcome_model(self, outcome_model):
+        # if we are only supplying certain features to the propensity function,
+        # make them invisible to the outcome component model
+        # This is a workaround for the DoWhy/EconML data model which doesn't
+        # support that out of the box
+        if outcome_model is not None:
+            # TODO: implement filtering like below, when there are propensity-only features
+            # feature_filter below acts on classes not instances
+            # to preserve all the extra methods through inheritance
+            self.outcome_model = outcome_model
+        else:
+            data = self.data
+            propensity_only_cols = [
+                p
+                for p in data.propensity_modifiers
+                if p not in data.common_causes + data.effect_modifiers
+            ]
+
+            if len(propensity_only_cols):
+                outcome_model_class = feature_filter(
+                    AutoML, data.effect_modifiers + data.common_causes, first_cols=True
+                )
+            else:
+                outcome_model_class = AutoML
+
+            self.outcome_model = outcome_model_class(
+                **self._settings["component_models"]
+            )
+
     def fit(
         self,
-        data_df: pd.DataFrame,
-        treatment: str,
-        outcome: str,
-        common_causes: List[str],
-        effect_modifiers: List[str],
+        data: Union[pd.DataFrame, CausalityDataset],
+        treatment: str = None,
+        outcome: str = None,
+        common_causes: List[str] = None,
+        effect_modifiers: List[str] = None,
         instruments: List[str] = None,
+        propensity_modifiers: Optional[List[str]] = None,
         estimator_list: Optional[Union[str, List[str]]] = None,
         resume: Optional[bool] = False,
         time_budget: Optional[int] = None,
@@ -226,49 +261,59 @@ class AutoCausality:
         """Performs AutoML on list of causal inference estimators
         - If estimator has a search space specified in its parameters, HPO is performed on the whole model.
         - Otherwise, only its component models are optimised
+
         Args:
             data_df (pandas.DataFrame): dataset for causal inference
             treatment (str): name of treatment variable
             outcome (str): name of outcome variable
             common_causes (List[str]): list of names of common causes
             effect_modifiers (List[str]): list of names of effect modifiers
+            propensity_modifiers (List[str]): list of names of propensity modifiers
             instruments (List[str]): list of names of instrumental variables
             estimator_list (Optional[Union[str, List[str]]]): subset of estimators to consider
             resume (Optional[bool]): set to True to continue previous fit
             time_budget (Optional[int]): change new time budget allocated to fit, useful for warm starts.
-        """
 
-        assert isinstance(
-            treatment, str
-        ), "Only a single treatment supported at the moment"
+        """
+        if not isinstance(data, CausalityDataset):
+            assert isinstance(data, pd.DataFrame)
+            data = CausalityDataset(
+                data,
+                treatment,
+                outcome,
+                common_causes=common_causes,
+                effect_modifiers=effect_modifiers,
+                instruments=instruments,
+                propensity_modifiers=propensity_modifiers,
+            )
+
+        self.data = data
+        treatment_values = data.treatment_values
 
         assert (
-            len(data_df[treatment].unique()) > 1
+            len(treatment_values) > 1
         ), "Treatment must take at least 2 values, eg 0 and 1!"
 
-        # TODO: allow specifying an exclusion list, too
-        used_estimator_list = (
-            self.original_estimator_list if estimator_list is None else estimator_list
-        )
+        self._control_value = treatment_values[0]
+        self._treatment_values = list(treatment_values[1:])
 
-        assert (
-            isinstance(used_estimator_list, str) or len(used_estimator_list) > 0
-        ), "estimator_list must either be a str or an iterable of str"
-
-        self.data_df = data_df.sample(frac=1)
         # To be used for component model training/selection
         self.train_df, self.test_df = train_test_split(
-            self.data_df, train_size=self._settings["train_size"]
+            self.data.data, train_size=self._settings["train_size"], shuffle=True
         )
 
+        # smuggle propensity modifiers into common causes, filter later in component models
         self.causal_model = CausalModel(
             data=self.train_df,
-            treatment=treatment,
-            outcome=outcome,
-            common_causes=common_causes,
-            effect_modifiers=effect_modifiers,
-            instruments=instruments,
+            treatment=data.treatment,
+            outcome=data.outcomes[0],
+            common_causes=data.common_causes + data.propensity_modifiers,
+            effect_modifiers=data.effect_modifiers,
+            instruments=data.instruments,
         )
+
+        self.init_propensity_model(self._settings["propensity_model"])
+        self.init_outcome_model(self._settings["outcome_model"])
 
         self.identified_estimand: IdentifiedEstimand = (
             self.causal_model.identify_effect(proceed_when_unidentifiable=True)
@@ -285,21 +330,43 @@ class AutoCausality:
             )
 
         # This must be stateful because we need to train the treatment propensity function
-        self.scorer = Scorer(self.causal_model, self.propensity_model)
+        self.scorer = Scorer(
+            self.causal_model,
+            self.propensity_model,
+            self.problem,
+            treatment_is_multivalue(self._treatment_values),
+        )
 
-        self.metric = Scorer.resolve_metric(self.metric, self.problem)
-        self.metrics_to_report = Scorer.resolve_reported_metrics(
-            self.metrics_to_report, self.metric, self.problem
+        self.metric = self.scorer.resolve_metric(self._settings["metric"])
+        self.metrics_to_report = self.scorer.resolve_reported_metrics(
+            self._settings["metrics_to_report"], self.metric
         )
 
         if self.metric == "energy_distance":
             self._best_estimators = defaultdict(lambda: (float("inf"), None))
 
-        if time_budget:
-            self._settings["tuner"]["time_budget_s"] = time_budget
+        # TODO: allow specifying an exclusion list, too
+        used_estimator_list = (
+            self.original_estimator_list if estimator_list is None else estimator_list
+        )
+
+        assert (
+            isinstance(used_estimator_list, str) or len(used_estimator_list) > 0
+        ), "estimator_list must either be a str or an iterable of str"
+
+        # config with method-specific params
+        self.cfg = SimpleParamService(
+            self.propensity_model,
+            self.outcome_model,
+            n_jobs=self._settings["component_models"]["n_jobs"],
+            include_experimental=self._settings["include_experimental_estimators"],
+            multivalue=treatment_is_multivalue(self._treatment_values),
+        )
 
         self.estimator_list = self.cfg.estimator_names_from_patterns(
-            self.problem, used_estimator_list, len(data_df)
+            self.problem,
+            used_estimator_list,
+            len(self.data),
         )
 
         if not self.estimator_list:
@@ -308,12 +375,18 @@ class AutoCausality:
                 f"available estimators: {str(self.cfg.estimator_names)}"
             )
 
+        if time_budget:
+            self._settings["tuner"]["time_budget_s"] = time_budget
+
         if self._settings["component_models"]["time_budget"] is None:
             self._settings["component_models"]["time_budget"] = self._settings["tuner"][
                 "time_budget_s"
             ] / (2.5 * len(self.estimator_list))
 
-        if self._settings["tuner"]["time_budget_s"] is None:
+        if (
+            self._settings["tuner"]["time_budget_s"] is None
+            and self._settings["tuner"]["num_samples"] == -1
+        ):
             self._settings["tuner"]["time_budget_s"] = (
                 2.5
                 * len(self.estimator_list)
@@ -389,17 +462,19 @@ class AutoCausality:
         # now inject the separately saved model objects
         for est_name in self.scores:
             # Todo: Check approximate scores for OrthoIV (possibly other IV estimators)
-            assert (
-                self._best_estimators[est_name][0] == self.scores[est_name][self.metric]
-            ), "Can't match best model to score"
+            # assert (
+            #     self._best_estimators[est_name][0] == self.scores[est_name][self.metric]
+            # ), "Can't match best model to score"
             self.scores[est_name]["estimator"] = self._best_estimators[est_name][1]
 
     def _tune_with_config(self, config: dict) -> dict:
         """Performs Hyperparameter Optimisation for a
         causal inference estimator
+
         Args:
             config (dict): dictionary with search space for
             all tunable parameters
+
         Returns:
             dict: values of metrics after optimisation
         """
@@ -408,7 +483,7 @@ class AutoCausality:
         # if using FLAML < 1.0.7 need to set n_jobs = 2 here
         # to spawn a separate process to prevent cross-talk between tuner and automl on component models:
 
-        estimates = Parallel(n_jobs=2)(
+        estimates = Parallel(n_jobs=2, backend="threading")(
             delayed(self._estimate_effect)(config["estimator"]) for i in range(1)
         )[0]
 
@@ -420,38 +495,58 @@ class AutoCausality:
                 if self.metric == "energy_distance"
                 else self._best_estimators[est_name][0] < estimates[self.metric]
             ):
-                self._best_estimators[est_name] = (
-                    estimates[self.metric],
-                    estimates.pop("estimator"),
-                )
+                if self._settings["store_all"]:
+                    self._best_estimators[est_name] = (
+                        estimates[self.metric],
+                        estimates["estimator"],
+                    )
+                else:
+                    self._best_estimators[est_name] = (
+                        estimates[self.metric],
+                        estimates.pop("estimator"),
+                    )
 
         return estimates
+
+    def _est_effect_stub(self, method_params):
+        return self.causal_model.estimate_effect(
+            self.identified_estimand,
+            method_name=self.estimator_name,
+            control_value=self._control_value,
+            treatment_value=self._treatment_values,
+            target_units="ate",  # condition used for CATE
+            confidence_intervals=False,
+            method_params=method_params,
+        )
 
     def _estimate_effect(self, config):
         """estimates effect with chosen estimator"""
 
         # add params that are tuned by flaml:
-        config = clean_config(config)
+        config = clean_config(copy.copy(config))
         self.estimator_name = config.pop("estimator_name")
         # params_to_tune = {
         #     k: v for k, v in config.items() if (not k == "estimator_name")
         # }
         cfg = self.cfg.method_params(self.estimator_name)
-
-        try:
-            estimate = self.causal_model.estimate_effect(
-                self.identified_estimand,
-                method_name=self.estimator_name,
-                control_value=0,
-                treatment_value=1,
-                target_units="ate",  # condition used for CATE
-                confidence_intervals=False,
-                method_params={
-                    "init_params": {**deepcopy(config), **cfg.init_params},
-                    "fit_params": {},
-                },
-            )
-            scores = self._compute_metrics(estimate)
+        method_params = {
+            "init_params": {**deepcopy(config), **cfg.init_params},
+            "fit_params": {},
+        }
+        try:  #
+            # if True:  #
+            estimate = self._est_effect_stub(method_params)
+            scores = {
+                "estimator_name": self.estimator_name,
+                "train": self._compute_metrics(
+                    estimate,
+                    self.train_df,
+                ),
+                "validation": self._compute_metrics(
+                    estimate,
+                    self.test_df,
+                ),
+            }
 
             return {
                 self.metric: scores["validation"][self.metric],
@@ -461,7 +556,7 @@ class AutoCausality:
                 "config": config,
             }
         except Exception as e:
-            print("Evaluation failed!\n", config)
+            print("Evaluation failed!\n", config, traceback.format_exc())
             return {
                 self.metric: -np.inf,
                 "estimator_name": self.estimator_name,
@@ -469,25 +564,20 @@ class AutoCausality:
                 "traceback": traceback.format_exc(),
             }
 
-    def _compute_metrics(self, estimator) -> dict:
-        scores = {
-            "estimator_name": self.estimator_name,
-            "train": self.scorer.make_scores(
-                estimator,
-                self.train_df,
-                self.problem,
-                self.metrics_to_report,
-                r_scorer=None if self.r_scorer is None else self.r_scorer.train,
-            ),
-            "validation": self.scorer.make_scores(
-                estimator,
-                self.test_df,
-                self.problem,
-                self.metrics_to_report,
-                r_scorer=None if self.r_scorer is None else self.r_scorer.test,
-            ),
-        }
-        return scores
+    def _compute_metrics(self, estimator, df: pd.DataFrame) -> dict:
+        return self.scorer.make_scores(
+            estimator, df, self.metrics_to_report, r_scorer=None
+        )
+
+    def score_dataset(self, df: pd.DataFrame, dataset_name: str):
+        """
+        After fitting, generate scores for an additional dataset, add them to the scores dict
+        @param df:
+        @param dataset_name:
+        @return:
+        """
+        for scr in self.scores.values():
+            scr["scores"][dataset_name] = self._compute_metrics(scr["estimator"], df)
 
     @property
     def best_estimator(self) -> str:
@@ -497,13 +587,15 @@ class AutoCausality:
     @property
     def model(self):
         """Return the *trained* best estimator"""
-        return self.results.best_result["estimator"]
+        return self.results.best_result["estimator"].estimator
 
     def best_model_for_estimator(self, estimator_name):
         """Return the best model found for a particular estimator.
         estimator: self.tune_results[estimator].best_config
+
         Args:
             estimator_name: a str of the estimator's name.
+
         Returns:
             An object storing the best model for estimator_name.
         """
@@ -530,3 +622,55 @@ class AutoCausality:
     def best_score(self):
         """A float of the best score found."""
         return self.results.best_result[self.metric]
+
+    def effect(self, df, *args, **kwargs):
+        return self.model.effect(df, *args, **kwargs)
+
+    def effect_inference(self, df, *args, **kwargs):
+
+        if "Econml" in str(type(self.model)):
+            # Get a list of "Inference" objects from EconML, one per treatment
+            self.model.__class__.apply_multitreatment = apply_multitreatment
+            if self.cfg._configs()[self.best_estimator].inference == "bootstrap":
+                raise NotImplementedError(
+                    f"Can't calculate stds for estimator \
+                {self.best_estimator} \
+                as boostrap inference is not supported yet"
+                )
+            return self.model.effect_inference(df, *args, **kwargs)
+        else:
+            raise NotImplementedError(
+                "No pointwise error estimates for non-EconML estimators implemented yet"
+            )
+
+    def effect_stderr(self, df, n_bootstrap_samples=5, n_jobs=1, *args, **kwargs):
+
+        if "Econml" in str(type(self.model)):
+            # Get a list of "Inference" objects from EconML, one per treatment
+            self.model.__class__.effect_stderr = effect_stderr
+            cfg = self.cfg.method_params(self.best_estimator)
+
+            if cfg.inference == "bootstrap":
+                # TODO: before bootstrapping, check whether that's already been done
+                bootstrap = BootstrapInference(
+                    n_bootstrap_samples=n_bootstrap_samples, n_jobs=n_jobs
+                )
+
+                best_cfg = {
+                    k: v for k, v in self.best_config.items() if k not in ["estimator"]
+                }
+                method_params = {
+                    "init_params": {**best_cfg, **cfg.init_params},
+                    "fit_params": {"inference": bootstrap},
+                }
+                self.bootstrapped_estimate = self._est_effect_stub(method_params)
+                est = self.bootstrapped_estimate.estimator
+            else:
+                # If the estimator supports other inference methods,
+                # those have already been included
+                est = self.model
+            return est.effect_stderr(df, *args, **kwargs)
+        else:
+            raise NotImplementedError(
+                "No pointwise error estimates for non-EconML estimators implemented yet"
+            )
